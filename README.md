@@ -1,5 +1,7 @@
 # FLVX
 
+> 此 fork 基于上游 `3.0.1-rc4`，修复 Linux UDP 通配监听的回复源地址错误及多目标会话混用问题，支持 IPv4、IPv6 和双栈。实现、限制和测试方法见 [UDP 修复说明](docs/udp-wildcard-source.md)。
+
 > **联系我们**: [Telegram群组](https://t.me/flvxchannel)
 
 
