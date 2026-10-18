@@ -1,10 +1,10 @@
 package udp
 
 import (
+	"encoding/binary"
 	"errors"
 	"net"
 
-	"golang.org/x/net/ipv4"
 	"golang.org/x/net/ipv6"
 	"golang.org/x/sys/unix"
 )
@@ -59,12 +59,23 @@ func (c *destinationConn) ReadFrom(b []byte) (int, net.Addr, error) {
 	var control []byte
 	var ifIndex int
 	if remote.IP.To4() != nil {
-		var cm ipv4.ControlMessage
-		if err = cm.Parse(oob[:oobn]); err != nil {
+		messages, err := unix.ParseSocketControlMessage(oob[:oobn])
+		if err != nil {
 			return 0, nil, err
 		}
-		dst, ifIndex = cm.Dst, cm.IfIndex
-		control = (&ipv4.ControlMessage{Src: dst, IfIndex: ifIndex}).Marshal()
+		for _, message := range messages {
+			if message.Header.Level != unix.IPPROTO_IP || message.Header.Type != unix.IP_PKTINFO {
+				continue
+			}
+			var info unix.Inet4Pktinfo
+			if _, err := binary.Decode(message.Data, binary.NativeEndian, &info); err != nil {
+				return 0, nil, err
+			}
+			dst, ifIndex = net.IP(info.Addr[:]), int(info.Ifindex)
+			// Spec_dst remains a local unicast address for broadcast destinations.
+			control = unix.PktInfo4(&unix.Inet4Pktinfo{Ifindex: info.Ifindex, Spec_dst: info.Spec_dst})
+			break
+		}
 	} else {
 		var cm ipv6.ControlMessage
 		if err = cm.Parse(oob[:oobn]); err != nil {

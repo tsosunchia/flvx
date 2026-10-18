@@ -21,6 +21,9 @@ these requests could share a session despite having different destinations.
 - Linux wildcard UDP sockets enable IPv4/IPv6 packet information. `recvmsg`
   preserves the datagram's local destination and interface; `sendmsg` uses the
   corresponding source address and interface when replying.
+- IPv4 keeps the original destination (`ipi_addr`) separate from the local
+  reply address (`ipi_spec_dst`), so broadcast requests receive unicast replies
+  rather than attempting to send with a broadcast source address.
 - The destination metadata travels through existing metrics, statistics,
   admission and traffic-limiter wrappers. The exposed remote address remains
   the real client address.
@@ -42,7 +45,7 @@ Use Go 1.25.4 or a compatible newer toolchain. From the repository root:
 ```sh
 cd go-gost
 CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath \
-  -ldflags '-s -w -X main.version=3.0.1-rc4-ipv6fix.1' -o flux_agent .
+  -ldflags '-s -w -X main.version=3.0.1-rc4-ipv6fix.2' -o flux_agent .
 ```
 
 Use the agent with the normal panel integration and forwarding configuration.
@@ -54,7 +57,10 @@ on Linux; the patch does not force a particular listener or outbound interface.
 The Linux destination tests cover IPv4 wildcard and dual-stack wildcard sockets,
 explicit IPv4/IPv6 bindings, one client source port contacting multiple local
 destinations, repeated requests, session expiry, and active metrics, statistics,
-admission and traffic-limit wrappers.
+admission and traffic-limit wrappers. A separate IPv6 case binds the client to
+`::1` and checks the exact remote IP and port for every destination. Broadcast
+tests exercise both IPv4 and dual-stack listeners, retaining the broadcast
+destination while checking that replies use a local unicast address.
 
 Run the standard suites on Linux:
 

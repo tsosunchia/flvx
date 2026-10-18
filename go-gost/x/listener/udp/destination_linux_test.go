@@ -11,6 +11,8 @@ import (
 	"testing"
 	"time"
 
+	"golang.org/x/sys/unix"
+
 	corelimiter "github.com/go-gost/core/limiter"
 	coretraffic "github.com/go-gost/core/limiter/traffic"
 	corelistener "github.com/go-gost/core/listener"
@@ -46,11 +48,13 @@ func TestDestinationPreservedThroughWrappers(t *testing.T) {
 	for _, tc := range []struct {
 		name, bind string
 		targets    []string
+		clientBind string
 	}{
-		{"ipv4-wildcard", "0.0.0.0:0", []string{"127.0.0.1", "127.0.0.2"}},
-		{"dual-stack-wildcard", "[::]:0", append([]string{"127.0.0.1", "127.0.0.2"}, v6...)},
-		{"explicit-ipv4", "127.0.0.1:0", []string{"127.0.0.1"}},
-		{"explicit-ipv6", "[::1]:0", []string{"::1"}},
+		{"ipv4-wildcard", "0.0.0.0:0", []string{"127.0.0.1", "127.0.0.2"}, ""},
+		{"dual-stack-wildcard", "[::]:0", append([]string{"127.0.0.1", "127.0.0.2"}, v6...), ""},
+		{"fixed-ipv6-source", "[::]:0", v6, "::1"},
+		{"explicit-ipv4", "127.0.0.1:0", []string{"127.0.0.1"}, ""},
+		{"explicit-ipv6", "[::1]:0", []string{"::1"}, ""},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			metrics.Enable(true)
@@ -73,6 +77,17 @@ func TestDestinationPreservedThroughWrappers(t *testing.T) {
 				t.Fatal(err)
 			}
 			defer ln.Close()
+			clientIP := net.IPv6unspecified
+			if tc.clientBind != "" {
+				clientIP = net.ParseIP(tc.clientBind)
+			}
+			client, err := net.ListenUDP("udp", &net.UDPAddr{IP: clientIP})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer client.Close()
+			client.SetDeadline(time.Now().Add(5 * time.Second))
+			clientAddr := client.LocalAddr().(*net.UDPAddr)
 			var accepted atomic.Int64
 			errors := make(chan error, 128)
 			go func() {
@@ -100,8 +115,13 @@ func TestDestinationPreservedThroughWrappers(t *testing.T) {
 								errors <- fmt.Errorf("local destination = %s, want %s", local.IP, tc.targets[target])
 								return
 							}
-							if _, ok := c.RemoteAddr().(*net.UDPAddr); !ok {
+							peer, ok := c.RemoteAddr().(*net.UDPAddr)
+							if !ok {
 								errors <- fmt.Errorf("peer type changed: %T", c.RemoteAddr())
+								return
+							}
+							if tc.clientBind != "" && (!peer.IP.Equal(clientAddr.IP) || peer.Port != clientAddr.Port) {
+								errors <- fmt.Errorf("peer endpoint = %s, want %s", peer, clientAddr)
 								return
 							}
 							if _, err := c.Write(buf[:n]); err != nil {
@@ -112,12 +132,6 @@ func TestDestinationPreservedThroughWrappers(t *testing.T) {
 					}()
 				}
 			}()
-			client, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv6unspecified})
-			if err != nil {
-				t.Fatal(err)
-			}
-			defer client.Close()
-			client.SetDeadline(time.Now().Add(5 * time.Second))
 			port := ln.Addr().(*net.UDPAddr).Port
 			var bytes int
 			for round := 0; round < 3; round++ {
@@ -162,6 +176,68 @@ func TestDestinationPreservedThroughWrappers(t *testing.T) {
 			}
 			if lim.in.Load() == 0 || lim.out.Load() == 0 {
 				t.Fatal("traffic limiter bypassed")
+			}
+		})
+	}
+}
+
+func TestBroadcastDestinationRepliesFromUnicast(t *testing.T) {
+	for _, bind := range []string{"0.0.0.0:0", "[::]:0"} {
+		t.Run(bind, func(t *testing.T) {
+			ln := NewListener(corelistener.AddrOption(bind),
+				corelistener.LoggerOption(xlogger.NewLogger(xlogger.OutputOption(io.Discard))))
+			if err := ln.Init(xmetadata.NewMetadata(map[string]any{"keepAlive": true})); err != nil {
+				t.Fatal(err)
+			}
+			defer ln.Close()
+			client, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer client.Close()
+			raw, err := client.SyscallConn()
+			if err != nil {
+				t.Fatal(err)
+			}
+			var sockErr error
+			if err := raw.Control(func(fd uintptr) {
+				sockErr = unix.SetsockoptInt(int(fd), unix.SOL_SOCKET, unix.SO_BROADCAST, 1)
+			}); err != nil {
+				t.Fatal(err)
+			}
+			if sockErr != nil {
+				t.Fatal(sockErr)
+			}
+			client.SetDeadline(time.Now().Add(5 * time.Second))
+			target := &net.UDPAddr{IP: net.IPv4(127, 255, 255, 255), Port: ln.Addr().(*net.UDPAddr).Port}
+			if _, err := client.WriteToUDP([]byte("broadcast"), target); err != nil {
+				t.Fatal(err)
+			}
+			conn, err := acceptWithTimeout(t, ln, time.Second)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer conn.Close()
+			if conn.LocalAddr().String() != target.String() {
+				t.Fatalf("local destination = %s, want %s", conn.LocalAddr(), target)
+			}
+			if conn.RemoteAddr().String() != client.LocalAddr().String() {
+				t.Fatalf("peer endpoint = %s, want %s", conn.RemoteAddr(), client.LocalAddr())
+			}
+			var buf [128]byte
+			n, err := conn.Read(buf[:])
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := conn.Write(buf[:n]); err != nil {
+				t.Fatalf("reply to broadcast request: %v", err)
+			}
+			n, from, err := client.ReadFromUDP(buf[:])
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !from.IP.Equal(net.IPv4(127, 0, 0, 1)) || from.Port != target.Port || string(buf[:n]) != "broadcast" {
+				t.Fatalf("unexpected broadcast reply %q from %s", buf[:n], from)
 			}
 		})
 	}

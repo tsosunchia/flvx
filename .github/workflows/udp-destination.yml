@@ -2,7 +2,7 @@ name: UDP Destination Regression
 
 on:
   push:
-    branches: ['fix/udp-wildcard-source']
+    branches: ['main', 'fix/udp-wildcard-source', 'pr/udp-wildcard-source']
   pull_request:
     paths:
       - 'go-gost/**'
@@ -40,6 +40,10 @@ jobs:
       - name: Check UDP races
         working-directory: go-gost/x
         run: go test -race ./internal/net/udp ./listener/udp
+
+      - name: Vet UDP implementation
+        working-directory: go-gost/x
+        run: go vet ./internal/net/udp ./listener/udp
 
       - name: Build destination regression executable
         working-directory: go-gost/x
